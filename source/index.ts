@@ -287,12 +287,26 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		this.#processQueue();
 	}
 
-	async #throwOnAbort(signal: AbortSignal): Promise<never> {
-		return new Promise((_resolve, reject) => {
-			signal.addEventListener('abort', () => {
+	// Creates a promise that rejects when the signal aborts, along with a
+	// cleanup function that removes only this task's abort listener.
+	// The cleanup must be called once the raced operation settles, so a
+	// shared signal does not accumulate listeners from settled tasks.
+	#createAbortPromise(signal: AbortSignal): {promise: Promise<never>; cleanup: () => void} {
+		let onAbort!: () => void;
+		const promise = new Promise<never>((_resolve, reject) => {
+			onAbort = () => {
 				reject(signal.reason);
-			}, {once: true});
+			};
+
+			signal.addEventListener('abort', onAbort, {once: true});
 		});
+
+		return {
+			promise,
+			cleanup() {
+				signal.removeEventListener('abort', onAbort);
+			},
+		};
 	}
 
 	/**
@@ -367,6 +381,11 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					timeout: options.timeout,
 				});
 
+				// Removes this task's own abort listener once the task settles.
+				// Stays undefined when nothing was registered (no signal, a
+				// pre-aborted signal, or a synchronously throwing task).
+				let removeAbortListener: (() => void) | undefined;
+
 				try {
 					// Check abort signal - if aborted, need to decrement the counter
 					// that was incremented in tryToStartAnother
@@ -394,7 +413,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					}
 
 					if (options.signal) {
-						operation = Promise.race([operation, this.#throwOnAbort(options.signal)]);
+						const {promise: abortPromise, cleanup} = this.#createAbortPromise(options.signal);
+						removeAbortListener = cleanup;
+						operation = Promise.race([operation, abortPromise]);
 					}
 
 					const result = await operation;
@@ -404,6 +425,10 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					reject(error);
 					this.emit('error', error);
 				} finally {
+					// The task has settled: detach only this task's abort listener
+					// so other tasks sharing the signal are not affected.
+					removeAbortListener?.();
+
 					// Remove from running tasks
 					this.#runningTasks.delete(taskSymbol);
 
