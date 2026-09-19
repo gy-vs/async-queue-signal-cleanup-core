@@ -287,12 +287,39 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 		this.#processQueue();
 	}
 
-	async #throwOnAbort(signal: AbortSignal): Promise<never> {
-		return new Promise((_resolve, reject) => {
-			signal.addEventListener('abort', () => {
+	#throwOnAbort(signal: AbortSignal): {promise: Promise<never>; cleanup: () => void} {
+		// Boxed so `cleanup` can release them after running, ensuring the
+		// cleanup closure itself does not retain the signal or listener.
+		const registration: {
+			signal?: AbortSignal;
+			listener?: () => void;
+		} = {signal};
+
+		const promise = new Promise<never>((_resolve, reject) => {
+			registration.listener = () => {
 				reject(signal.reason);
-			}, {once: true});
+			};
+
+			signal.addEventListener('abort', registration.listener, {once: true});
 		});
+
+		return {
+			promise,
+			cleanup() {
+				const {signal: registeredSignal, listener} = registration;
+
+				// Release references first so a retained cleanup closure
+				// does not keep the signal or listener alive.
+				registration.signal = undefined;
+				registration.listener = undefined;
+
+				// Only removes this task's own listener. If the listener already
+				// fired (`once`) or was already cleaned up, this is a no-op.
+				if (registeredSignal !== undefined && listener !== undefined) {
+					registeredSignal.removeEventListener('abort', listener);
+				}
+			},
+		};
 	}
 
 	/**
@@ -367,6 +394,11 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					timeout: options.timeout,
 				});
 
+				// Per-task abort listener cleanup, invoked in `finally` below so
+				// every settlement path (success, failure, timeout, abort)
+				// removes exactly its own registration.
+				let cleanupAbortListener: (() => void) | undefined;
+
 				try {
 					// Check abort signal - if aborted, need to decrement the counter
 					// that was incremented in tryToStartAnother
@@ -394,7 +426,9 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					}
 
 					if (options.signal) {
-						operation = Promise.race([operation, this.#throwOnAbort(options.signal)]);
+						const {promise, cleanup} = this.#throwOnAbort(options.signal);
+						cleanupAbortListener = cleanup;
+						operation = Promise.race([operation, promise]);
 					}
 
 					const result = await operation;
@@ -404,6 +438,12 @@ export default class PQueue<QueueType extends Queue<RunFunction, EnqueueOptionsT
 					reject(error);
 					this.emit('error', error);
 				} finally {
+					// The operation has settled, so this task's abort listener is
+					// no longer needed. Removing it here covers all paths and
+					// leaves other tasks' listeners on a shared signal untouched.
+					cleanupAbortListener?.();
+					cleanupAbortListener = undefined;
+
 					// Remove from running tasks
 					this.#runningTasks.delete(taskSymbol);
 
